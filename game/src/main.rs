@@ -1,8 +1,11 @@
 use glam::Vec3A;
 use rbot::App;
-use rbot::InputCtx;
+use rbot::State;
 use rend3::{
-    datatypes::{CameraProjection, RendererTextureFormat, Texture},
+    datatypes::{
+        CameraProjection, DirectionalLightHandle, MaterialHandle, MeshHandle, ObjectHandle,
+        RendererTextureFormat, Texture,
+    },
     Renderer,
 };
 
@@ -84,30 +87,45 @@ fn load_skybox(renderer: &Renderer) {
     renderer.set_background_texture(handle);
 }
 
+fn main() {
+    App::run(init);
+}
+
 struct Game1 {
     camera: rend3::datatypes::Camera,
+    human_mesh: MeshHandle,
+    human_material: MaterialHandle,
+    humans: Vec<ObjectHandle>,
+    light_handle: DirectionalLightHandle,
 }
 
-fn main() {
-    App::new(init).run(update);
-}
-
-fn init(renderer: &Renderer) -> Game1 {
+fn init(app: &mut App) -> Game1 {
     let (mesh, material) = load_gltf(
-        &renderer,
+        &app.renderer,
         concat!(env!("CARGO_MANIFEST_DIR"), "/data/human.glb"),
     );
 
-    // Combine the mesh and the material with a location to give an object.
-    let object = rend3::datatypes::Object {
-        mesh,
-        material,
-        transform: rend3::datatypes::AffineTransform {
-            // Need to flip gltf's coords and winding order
-            transform: glam::Mat4::from_scale(glam::Vec3::new(1., 1., -1.)),
-        },
-    };
-    let _object_handle = renderer.add_object(object);
+    let mut humans = vec![];
+
+    for x in 0..10 {
+        for z in 0..10 {
+            // Combine the mesh and the material with a location to give an object.
+            let object = rend3::datatypes::Object {
+                mesh,
+                material,
+                transform: rend3::datatypes::AffineTransform {
+                    // Need to flip gltf's coords and winding order
+                    transform: glam::Mat4::from_scale_rotation_translation(
+                        glam::Vec3::new(1.0, 1.0, -1.0),
+                        glam::Quat::default(),
+                        glam::Vec3::new(x as f32 * 5.0, 0.0, z as f32 * 5.0),
+                    ),
+                },
+            };
+            let object_handle = app.renderer.add_object(object);
+            humans.push(object_handle);
+        }
+    }
 
     // Set camera's location
     let camera = rend3::datatypes::Camera {
@@ -121,81 +139,89 @@ fn init(renderer: &Renderer) -> Game1 {
     };
 
     // Create a single directional light
-    renderer.add_directional_light(rend3::datatypes::DirectionalLight {
-        color: glam::Vec3::one(),
-        intensity: 10.0,
-        // Direction will be normalized
-        direction: glam::Vec3::new(-1.0, -4.0, 2.0),
-    });
+    let light_handle = app
+        .renderer
+        .add_directional_light(rend3::datatypes::DirectionalLight {
+            color: glam::Vec3::one(),
+            intensity: 10.0,
+            // Direction will be normalized
+            direction: glam::Vec3::new(-1.0, -4.0, 2.0),
+        });
 
-    load_skybox(&renderer);
+    load_skybox(&app.renderer);
 
-    Game1 { camera }
+    Game1 {
+        camera,
+        human_mesh: mesh,
+        human_material: material,
+        humans,
+        light_handle,
+    }
 }
 
-fn update(game: &mut Game1, input_ctx: InputCtx, renderer: &Renderer, dt: f32) {
-    let camera = &mut game.camera;
+impl State for Game1 {
+    fn update(&mut self, app: &mut App) {
+        use std::f32::consts::TAU;
 
-    use std::f32::consts::TAU;
-
-    for (dx, dy) in input_ctx.mouse_deltas() {
-        match camera.projection {
-            CameraProjection::Projection {
-                ref mut yaw,
-                ref mut pitch,
-                ..
-            } => {
-                *yaw += (dx / 1000.0) as f32;
-                *pitch += (dy / 1000.0) as f32;
-                if *yaw < 0.0 {
-                    *yaw += TAU;
-                } else if *yaw >= TAU {
-                    *yaw -= TAU;
+        for (dx, dy) in app.input.mouse_deltas() {
+            match &mut self.camera.projection {
+                CameraProjection::Projection {
+                    ref mut yaw,
+                    ref mut pitch,
+                    ..
+                } => {
+                    *yaw += (dx / 1000.0) as f32;
+                    *pitch += (dy / 1000.0) as f32;
+                    if *yaw < 0.0 {
+                        *yaw += TAU;
+                    } else if *yaw >= TAU {
+                        *yaw -= TAU;
+                    }
+                    *pitch = pitch
+                        .max(-std::f32::consts::FRAC_PI_2 + 0.0001)
+                        .min(std::f32::consts::FRAC_PI_2 - 0.0001);
                 }
-                *pitch = pitch
-                    .max(-std::f32::consts::FRAC_PI_2 + 0.0001)
-                    .min(std::f32::consts::FRAC_PI_2 - 0.0001);
+                _ => unreachable!(),
             }
-            _ => unreachable!(),
         }
-    }
 
-    let forward = {
-        if let CameraProjection::Projection { yaw, pitch, .. } = camera.projection {
-            Vec3A::new(
-                yaw.sin() * pitch.cos(),
-                -pitch.sin(),
-                yaw.cos() * pitch.cos(),
-            )
-        } else {
-            unreachable!()
+        let forward = {
+            if let CameraProjection::Projection { yaw, pitch, .. } = &mut self.camera.projection {
+                Vec3A::new(
+                    yaw.sin() * pitch.cos(),
+                    -pitch.sin(),
+                    yaw.cos() * pitch.cos(),
+                )
+            } else {
+                unreachable!()
+            }
+        };
+        let up = Vec3A::unit_y();
+        let side: Vec3A = forward.cross(up).normalize();
+        let velocity = match app.input.is_scancode_pressed(platform::Scancodes::SHIFT) {
+            true => 2.0,
+            false => 1.0,
+        };
+
+        if app.input.is_scancode_pressed(platform::Scancodes::W) {
+            self.camera.location += forward * velocity * app.delta_time;
         }
-    };
-    let up = Vec3A::unit_y();
-    let side: Vec3A = forward.cross(up).normalize();
-    let velocity = match input_ctx.is_scancode_pressed(platform::Scancodes::SHIFT) {
-        true => 2.0,
-        false => 1.0,
-    };
+        if app.input.is_scancode_pressed(platform::Scancodes::S) {
+            self.camera.location -= forward * velocity * app.delta_time;
+        }
+        if app.input.is_scancode_pressed(platform::Scancodes::A) {
+            self.camera.location += side * velocity * app.delta_time;
+        }
+        if app.input.is_scancode_pressed(platform::Scancodes::D) {
+            self.camera.location -= side * velocity * app.delta_time;
+        }
+        if app.input.is_scancode_pressed(platform::Scancodes::Q) {
+            self.camera.location += up * velocity * app.delta_time;
+        }
+        if app.input.is_scancode_pressed(platform::Scancodes::Z) {
+            self.camera.location -= up * velocity * app.delta_time;
+        }
 
-    if input_ctx.is_scancode_pressed(platform::Scancodes::W) {
-        camera.location += forward * velocity * dt;
+        app.renderer.set_camera_data(self.camera);
     }
-    if input_ctx.is_scancode_pressed(platform::Scancodes::S) {
-        camera.location -= forward * velocity * dt;
-    }
-    if input_ctx.is_scancode_pressed(platform::Scancodes::A) {
-        camera.location += side * velocity * dt;
-    }
-    if input_ctx.is_scancode_pressed(platform::Scancodes::D) {
-        camera.location -= side * velocity * dt;
-    }
-    if input_ctx.is_scancode_pressed(platform::Scancodes::Q) {
-        camera.location += up * velocity * dt;
-    }
-    if input_ctx.is_scancode_pressed(platform::Scancodes::Z) {
-        camera.location -= up * velocity * dt;
-    }
-
-    renderer.set_camera_data(*camera);
 }

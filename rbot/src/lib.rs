@@ -1,33 +1,36 @@
 use rend3::Renderer;
-use rend3_list::DefaultPipelines;
 use std::{sync::Arc, time::Instant};
-use winit::{event::*, window::Window};
+use winit::event::*;
 
 pub mod input;
 pub use input::InputCtx;
 
-pub struct App<T: 'static> {
-    options: rend3::RendererOptions,
-    event_loop: winit::event_loop::EventLoop<()>,
-    window: Window,
-    renderer: Arc<Renderer>,
-    pipelines: DefaultPipelines,
-    state: T,
+pub trait State: Sized {
+    fn update(&mut self, app: &mut App);
 }
 
-impl<T: 'static> App<T> {
-    pub fn new(init: impl FnOnce(&Renderer) -> T) -> Self {
+pub struct App {
+    pub renderer: Arc<Renderer>,
+    pub input: InputCtx,
+    pub delta_time: f32,
+}
+
+impl App {
+    pub fn run<T: State + 'static>(state_init: impl FnOnce(&mut App) -> T) {
+        // Setup logging
+        wgpu_subscriber::initialize_default_subscriber(None);
+
         // Create event loop and window
         let event_loop = winit::event_loop::EventLoop::new();
         let window = {
             let mut builder = winit::window::WindowBuilder::new();
-            builder = builder.with_title("rend3 cube");
+            builder = builder.with_title("rbot engine");
             builder.build(&event_loop).expect("Could not build window")
         };
 
         let window_size = window.inner_size();
 
-        let options = rend3::RendererOptions {
+        let mut options = rend3::RendererOptions {
             vsync: rend3::VSyncMode::Off,
             size: [window_size.width, window_size.height],
         };
@@ -45,53 +48,15 @@ impl<T: 'static> App<T> {
             rend3_list::DefaultPipelines::new(&renderer, &shaders).await
         });
 
-        Self {
-            options,
-            event_loop,
-            window,
-            state: init(&renderer),
+        let mut app = App {
             renderer,
-            pipelines,
-        }
-    }
-
-    pub fn run(self, mut update: impl FnMut(&mut T, InputCtx, &Renderer, f32) + 'static) {
-        let Self {
-            mut options,
-            event_loop,
-            window,
-            renderer,
-            pipelines,
-            mut state,
-        } = self;
-
-        // Setup logging
-        wgpu_subscriber::initialize_default_subscriber(None);
-
+            input: InputCtx::new_empty(),
+            delta_time: 0.0f32,
+        };
+        let mut state = state_init(&mut app);
         let mut timestamp_last_frame = Instant::now();
-        let mut frame_times = histogram::Histogram::new();
-
-        let mut input_ctx = InputCtx::new_empty();
 
         event_loop.run(move |event, _, control| match event {
-            Event::WindowEvent {
-                event: WindowEvent::KeyboardInput { input, .. },
-                ..
-            } => {
-                input_ctx.update_from_keyboard_event(input);
-            }
-            Event::WindowEvent {
-                event: WindowEvent::MouseInput { state, button, .. },
-                ..
-            } => {
-                input_ctx.update_from_mouse_event(state, button);
-            }
-            Event::WindowEvent {
-                event: WindowEvent::Focused(_),
-                ..
-            } => {
-                //cursor_grab = b;
-            }
             // Close button was clicked, we should close.
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -99,6 +64,27 @@ impl<T: 'static> App<T> {
             } => {
                 *control = winit::event_loop::ControlFlow::Exit;
             }
+
+            // Input handling
+            Event::WindowEvent {
+                event: WindowEvent::KeyboardInput { input, .. },
+                ..
+            } => {
+                app.input.update_from_keyboard_event(input);
+            }
+            Event::WindowEvent {
+                event: WindowEvent::MouseInput { state, button, .. },
+                ..
+            } => {
+                app.input.update_from_mouse_event(state, button);
+            }
+            Event::DeviceEvent {
+                event: event @ DeviceEvent::MouseMotion { .. },
+                ..
+            } => {
+                app.input.update_from_mouse_motion_event(event);
+            }
+
             // Window was resized, need to resize renderer.
             Event::WindowEvent {
                 event: WindowEvent::Resized(size),
@@ -106,31 +92,19 @@ impl<T: 'static> App<T> {
             } => {
                 options.size = [size.width, size.height];
             }
-            Event::DeviceEvent {
-                event: event @ DeviceEvent::MouseMotion { .. },
-                ..
-            } => {
-                input_ctx.update_from_mouse_motion_event(event);
-            }
+
             // Render!
             Event::MainEventsCleared => {
                 window.request_redraw();
             }
             Event::RedrawRequested(..) => {
                 let now = Instant::now();
-                let delta_time = now - timestamp_last_frame;
-                frame_times
-                    .increment(delta_time.as_micros() as u64)
-                    .unwrap();
+                app.delta_time = (now - timestamp_last_frame).as_secs_f32();
                 timestamp_last_frame = now;
 
-                update(
-                    &mut state,
-                    input_ctx.clone(),
-                    &renderer,
-                    delta_time.as_secs_f32(),
-                );
-                renderer.set_options(options.clone());
+                state.update(&mut app);
+
+                app.renderer.set_options(options.clone());
 
                 // Size of the internal buffers used for rendering.
                 //
@@ -141,18 +115,18 @@ impl<T: 'static> App<T> {
 
                 // Default set of rendering commands using the default shaders.
                 let render_list = rend3_list::default_render_list(
-                    renderer.mode(),
+                    app.renderer.mode(),
                     internal_renderbuffer_size,
                     &pipelines,
                 );
 
                 // Dispatch a render!
-                let handle = renderer.render(render_list, rend3::RendererOutput::InternalSwapchain);
+                pollster::block_on(
+                    app.renderer
+                        .render(render_list, rend3::RendererOutput::InternalSwapchain),
+                );
 
-                // Wait until it's done
-                pollster::block_on(handle);
-
-                input_ctx.next_frame();
+                app.input.next_frame();
             }
             // Other events we don't care about
             _ => {}
