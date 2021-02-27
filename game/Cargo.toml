@@ -17,3 +17,4 @@ wgpu-subscriber = "0.1"
 image = "0.23"
 gltf = { version = "0.15", features = ["utils"]}
 histogram = "0.6"
+obj = "0.10"

@@ -1,4 +1,7 @@
-use glam::Vec3A;
+use std::collections::{HashMap, HashSet};
+
+use glam::{quat, Mat4, Vec3, Vec3A, Vec4};
+use gltf::buffer::Data;
 use rbot::App;
 use rbot::State;
 use rend3::{
@@ -20,23 +23,22 @@ fn load_gltf(
 ) {
     let (doc, datas, _) = gltf::import(path).unwrap();
     let mesh_data = doc.meshes().next().expect("no meshes in data.glb");
+    load_mesh(mesh_data, &datas, renderer)
+}
 
-    let primitive = mesh_data
-        .primitives()
-        .next()
-        .expect("no primitives in data.glb");
-    let reader = primitive.reader(|b| Some(&datas.get(b.index())?.0[..b.length()]));
+fn load_mesh(
+    mesh: gltf::Mesh,
+    data: &[Data],
+    renderer: &rend3::Renderer,
+) -> (
+    rend3::datatypes::MeshHandle,
+    rend3::datatypes::MaterialHandle,
+) {
+    let primitive = mesh.primitives().next().expect("no primitives in data.glb");
+    let reader = primitive.reader(|b| Some(&data.get(b.index())?.0[..b.length()]));
 
-    let vertex_positions: Vec<_> = reader
-        .read_positions()
-        .unwrap()
-        .map(glam::Vec3::from)
-        .collect();
-    let vertex_normals: Vec<_> = reader
-        .read_normals()
-        .unwrap()
-        .map(glam::Vec3::from)
-        .collect();
+    let vertex_positions: Vec<_> = reader.read_positions().unwrap().map(Vec3::from).collect();
+    let vertex_normals: Vec<_> = reader.read_normals().unwrap().map(Vec3::from).collect();
     let vertex_tangents: Vec<_> = reader
         .read_tangents()
         .unwrap()
@@ -80,7 +82,10 @@ fn load_skybox(renderer: &Renderer) {
         format: RendererTextureFormat::Rgba8Linear,
         width: 1,
         height: 1,
-        data: vec![0_u8; 6 * 4],
+        data: vec![
+            30, 0, 0, 255, 30, 0, 0, 255, 30, 0, 0, 255, 30, 0, 0, 255, 30, 0, 0, 255, 30, 0, 0,
+            255,
+        ],
         label: None,
         mip_levels: 1,
     });
@@ -93,39 +98,187 @@ fn main() {
 
 struct Game1 {
     camera: rend3::datatypes::Camera,
+
+    navmesh: Navmesh,
+
     human_mesh: MeshHandle,
     human_material: MaterialHandle,
-    humans: Vec<ObjectHandle>,
+
     light_handle: DirectionalLightHandle,
+
+    level_mesh: MeshHandle,
+    level_material: MaterialHandle,
+    level_handle: ObjectHandle,
+}
+
+#[derive(Debug)]
+struct Triangle {
+    verts: [usize; 3],
+    neighbours: Vec<usize>,
+}
+
+struct Navmesh {
+    verts: Box<[[f32; 3]]>,
+    tris: Box<[Triangle]>,
+    vert_to_tris: HashMap<usize, Box<[usize]>>,
+}
+
+impl Navmesh {
+    fn path_from_vert_to_vert(&self, from: usize, to: usize) -> Vec<usize> {
+        #[derive(Eq, PartialEq, Hash, Copy, Clone)]
+        struct Node {
+            vert: usize,
+        }
+
+        let calculate_vert_distance = |v1: usize, v2: usize| -> u32 {
+            let from: Vec3 = self.verts[v1].into();
+            let to: Vec3 = self.verts[v2].into();
+            (to - from).abs().length() as u32
+        };
+
+        let calculate_f_score =
+            |g_score: u32, vert: usize| -> u32 { g_score + calculate_vert_distance(vert, to) };
+
+        let start_node = Node { vert: from };
+
+        let mut open_set = Vec::<Node>::new();
+        open_set.push(start_node);
+
+        let mut came_from = HashMap::<Node, Node>::new();
+
+        let mut g_scores = HashMap::<Node, u32>::new();
+        g_scores.insert(start_node, 0);
+
+        let mut f_scores = HashMap::<Node, u32>::new();
+        f_scores.insert(start_node, calculate_f_score(0, start_node.vert));
+
+        loop {
+            open_set.sort_by(|n1, n2| std::cmp::Ord::cmp(&f_scores[&n1], &f_scores[&n2]));
+            let cur_node = open_set.remove(0); // this will panic if there's no path
+            if cur_node.vert == to {
+                // reached goal
+                let mut path = Vec::new();
+                path.push(cur_node.vert);
+
+                let mut cur_node = cur_node;
+                while let Some(prev_node) = came_from.get(&cur_node) {
+                    path.insert(0, prev_node.vert);
+                    cur_node = *prev_node;
+                }
+
+                return path;
+            }
+
+            for neighbour in self.vert_to_tris[&cur_node.vert]
+                .iter()
+                .flat_map(|&tri| &self.tris[tri].verts)
+                .map(|&vert| Node { vert })
+            {
+                let tentative_g =
+                    g_scores[&cur_node] + calculate_vert_distance(cur_node.vert, neighbour.vert);
+
+                let &g_score = g_scores.get(&neighbour).unwrap_or(&u32::MAX);
+                if tentative_g < g_score {
+                    came_from.insert(neighbour, cur_node);
+                    g_scores.insert(neighbour, tentative_g);
+                    f_scores.insert(neighbour, calculate_f_score(tentative_g, neighbour.vert));
+                    if open_set.contains(&neighbour) == false {
+                        open_set.push(neighbour);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn init(app: &mut App) -> Game1 {
-    let (mesh, material) = load_gltf(
+    let navmesh = {
+        let navmesh =
+            obj::Obj::load(concat!(env!("CARGO_MANIFEST_DIR"), "/data/navmesh.obj")).unwrap();
+
+        let obj::ObjData {
+            position, objects, ..
+        } = navmesh.data;
+        let verts: Box<[[f32; 3]]> = position.into_iter().map(|[x, y, z]| [x, y, -z]).collect();
+
+        let mut tris = objects[0].groups[0]
+            .polys
+            .iter()
+            .map(|poly| &poly.0)
+            .map(|poly| [poly[0].0, poly[1].0, poly[2].0])
+            .map(|verts| Triangle {
+                verts,
+                neighbours: Vec::new(),
+            })
+            .collect::<Box<[Triangle]>>();
+
+        let mut vert_to_tris: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (n, tri) in tris.iter().enumerate() {
+            for vert in tri.verts.iter().copied() {
+                vert_to_tris.entry(vert).or_default().push(n);
+            }
+        }
+
+        for (n, tri) in tris.iter_mut().enumerate() {
+            for vert in tri.verts.iter().copied() {
+                for &neighbour in vert_to_tris[&vert].iter().filter(|&&tri_idx| tri_idx != n) {
+                    tri.neighbours.push(neighbour);
+                }
+            }
+        }
+
+        let vert_to_tris = vert_to_tris
+            .into_iter()
+            .map(|(vert_idx, tris)| (vert_idx, tris.into_boxed_slice()))
+            .collect::<HashMap<usize, Box<[usize]>>>();
+
+        Navmesh {
+            verts,
+            tris,
+            vert_to_tris,
+        }
+    };
+
+    let (human_mesh, human_material) = load_gltf(
         &app.renderer,
         concat!(env!("CARGO_MANIFEST_DIR"), "/data/human.glb"),
     );
 
-    let mut humans = vec![];
-
-    for x in 0..10 {
-        for z in 0..10 {
-            // Combine the mesh and the material with a location to give an object.
-            let object = rend3::datatypes::Object {
-                mesh,
-                material,
-                transform: rend3::datatypes::AffineTransform {
-                    // Need to flip gltf's coords and winding order
-                    transform: glam::Mat4::from_scale_rotation_translation(
-                        glam::Vec3::new(1.0, 1.0, -1.0),
-                        glam::Quat::default(),
-                        glam::Vec3::new(x as f32 * 5.0, 0.0, z as f32 * 5.0),
-                    ),
-                },
-            };
-            let object_handle = app.renderer.add_object(object);
-            humans.push(object_handle);
-        }
+    for human_spawn_pos in navmesh
+        .path_from_vert_to_vert(39, 56)
+        .iter()
+        .map(|&vert| navmesh.verts[vert])
+    {
+        // for &human_spawn_pos in navmesh.verts.iter() {
+        // Combine the mesh and the material with a location to give an object.
+        let object = rend3::datatypes::Object {
+            mesh: human_mesh,
+            material: human_material,
+            transform: rend3::datatypes::AffineTransform {
+                // Need to flip gltf's coords and winding order
+                transform: Mat4::from_scale_rotation_translation(
+                    Vec3::new(1.0, 1.0, -1.0),
+                    glam::Quat::default(),
+                    human_spawn_pos.into(),
+                ),
+            },
+        };
+        app.renderer.add_object(object);
     }
+
+    let (level_mesh, level_material) = load_gltf(
+        &app.renderer,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/data/level.glb"),
+    );
+    let object = rend3::datatypes::Object {
+        mesh: level_mesh,
+        material: level_material,
+        transform: rend3::datatypes::AffineTransform {
+            // Need to flip gltf's coords and winding order
+            transform: Mat4::from_scale(Vec3::new(1.0, 1.0, -1.0)),
+        },
+    };
+    let level_handle = app.renderer.add_object(object);
 
     // Set camera's location
     let camera = rend3::datatypes::Camera {
@@ -142,20 +295,27 @@ fn init(app: &mut App) -> Game1 {
     let light_handle = app
         .renderer
         .add_directional_light(rend3::datatypes::DirectionalLight {
-            color: glam::Vec3::one(),
+            color: Vec3::one(),
             intensity: 10.0,
             // Direction will be normalized
-            direction: glam::Vec3::new(-1.0, -4.0, 2.0),
+            direction: Vec3::new(-3.0, -3.0, 2.0),
         });
 
     load_skybox(&app.renderer);
 
     Game1 {
         camera,
-        human_mesh: mesh,
-        human_material: material,
-        humans,
+
+        navmesh,
+
+        human_mesh,
+        human_material,
+
         light_handle,
+
+        level_material,
+        level_mesh,
+        level_handle,
     }
 }
 
@@ -199,7 +359,7 @@ impl State for Game1 {
         let up = Vec3A::unit_y();
         let side: Vec3A = forward.cross(up).normalize();
         let velocity = match app.input.is_scancode_pressed(platform::Scancodes::SHIFT) {
-            true => 2.0,
+            true => 4.0,
             false => 1.0,
         };
 
