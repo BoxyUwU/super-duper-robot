@@ -103,6 +103,10 @@ struct Game1 {
 
     human_mesh: MeshHandle,
     human_material: MaterialHandle,
+    human_handle: ObjectHandle,
+    human_position: Vec3,
+
+    path: Vec<usize>,
 
     light_handle: DirectionalLightHandle,
 
@@ -244,27 +248,26 @@ fn init(app: &mut App) -> Game1 {
         concat!(env!("CARGO_MANIFEST_DIR"), "/data/human.glb"),
     );
 
-    for human_spawn_pos in navmesh
-        .path_from_vert_to_vert(39, 56)
-        .iter()
-        .map(|&vert| navmesh.verts[vert])
-    {
-        // for &human_spawn_pos in navmesh.verts.iter() {
-        // Combine the mesh and the material with a location to give an object.
-        let object = rend3::datatypes::Object {
-            mesh: human_mesh,
-            material: human_material,
-            transform: rend3::datatypes::AffineTransform {
-                // Need to flip gltf's coords and winding order
-                transform: Mat4::from_scale_rotation_translation(
-                    Vec3::new(1.0, 1.0, -1.0),
-                    glam::Quat::default(),
-                    human_spawn_pos.into(),
-                ),
-            },
-        };
-        app.renderer.add_object(object);
-    }
+    let path_start_vert = 39;
+    let path_end_vert = 56;
+    let human_position = navmesh.verts[path_start_vert].into();
+    // Combine the mesh and the material with a location to give an object.
+    let object = rend3::datatypes::Object {
+        mesh: human_mesh,
+        material: human_material,
+        transform: rend3::datatypes::AffineTransform {
+            // Need to flip gltf's coords and winding order
+            transform: Mat4::from_scale_rotation_translation(
+                Vec3::new(1.0, 1.0, -1.0),
+                glam::Quat::default(),
+                human_position,
+            ),
+        },
+    };
+    let human_handle = app.renderer.add_object(object);
+
+    let mut path = navmesh.path_from_vert_to_vert(path_start_vert, path_end_vert);
+    path.remove(0);
 
     let (level_mesh, level_material) = load_gltf(
         &app.renderer,
@@ -310,6 +313,9 @@ fn init(app: &mut App) -> Game1 {
 
         human_mesh,
         human_material,
+        human_handle,
+        human_position,
+        path,
 
         light_handle,
 
@@ -383,5 +389,35 @@ impl State for Game1 {
         }
 
         app.renderer.set_camera_data(self.camera);
+
+        if self.path.len() > 0 {
+            let human_speed = 1.0 * app.delta_time;
+            let target_pos: Vec3 = self.navmesh.verts[self.path[0]].into();
+            let length = (self.human_position - target_pos).length();
+
+            if human_speed > length {
+                let overshoot = human_speed - length;
+                self.human_position = target_pos;
+                self.path.remove(0);
+                if self.path.len() > 0 {
+                    let target_pos: Vec3 = self.navmesh.verts[self.path[0]].into();
+                    self.human_position +=
+                        (target_pos - self.human_position).normalize() * overshoot;
+                }
+            } else {
+                self.human_position += (target_pos - self.human_position).normalize() * human_speed;
+            }
+        }
+
+        app.renderer.set_object_transform(
+            self.human_handle,
+            rend3::datatypes::AffineTransform {
+                transform: Mat4::from_scale_rotation_translation(
+                    Vec3::new(1.0, 1.0, -1.0),
+                    glam::Quat::default(),
+                    self.human_position,
+                ),
+            },
+        )
     }
 }
