@@ -2,6 +2,13 @@ use std::collections::{HashMap, HashSet};
 
 use glam::{quat, Mat4, Vec3, Vec3A, Vec4};
 use gltf::buffer::Data;
+use rapier3d::geometry::{BroadPhase, ColliderBuilder, ColliderSet, NarrowPhase};
+use rapier3d::na::{Isometry3, Point3, Vector3};
+use rapier3d::pipeline::PhysicsPipeline;
+use rapier3d::{
+    dynamics::{IntegrationParameters, JointSet, RigidBodyBuilder, RigidBodyHandle, RigidBodySet},
+    na::Quaternion,
+};
 use rbot::App;
 use rbot::State;
 use rend3::{
@@ -83,8 +90,8 @@ fn load_skybox(renderer: &Renderer) {
         width: 1,
         height: 1,
         data: vec![
-            30, 0, 0, 255, 30, 0, 0, 255, 30, 0, 0, 255, 30, 0, 0, 255, 30, 0, 0, 255, 30, 0, 0,
-            255,
+            20, 20, 20, 255, 20, 20, 20, 255, 20, 20, 20, 255, 20, 20, 20, 255, 20, 20, 20, 255,
+            20, 20, 20, 255,
         ],
         label: None,
         mip_levels: 1,
@@ -113,6 +120,19 @@ struct Game1 {
     level_mesh: MeshHandle,
     level_material: MaterialHandle,
     level_handle: ObjectHandle,
+
+    // physics
+    physics_pipeline: PhysicsPipeline,
+    gravity: Vector3<f32>,
+    physics_integration_parameters: IntegrationParameters,
+    broad_phase: BroadPhase,
+    narrow_phase: NarrowPhase,
+    rigidbodies: RigidBodySet,
+    colliders: ColliderSet,
+    joints: JointSet,
+
+    player_body_handle: RigidBodyHandle,
+    level_body_handle: RigidBodyHandle,
 }
 
 #[derive(Debug)]
@@ -269,6 +289,54 @@ fn init(app: &mut App) -> Game1 {
     let mut path = navmesh.path_from_vert_to_vert(path_start_vert, path_end_vert);
     path.remove(0);
 
+    // Rapier stuff
+    //
+    let level_collider = obj::Obj::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/data/level_collider.obj"
+    ))
+    .unwrap();
+
+    let obj::ObjData {
+        position, objects, ..
+    } = level_collider.data;
+
+    let verts: Vec<Point3<f32>> = position
+        .into_iter()
+        .map(|[x, y, z]| Point3::new(x, y, -z))
+        .collect();
+
+    let indices: Vec<[u32; 3]> = objects[0].groups[0]
+        .polys
+        .iter()
+        .map(|poly| &poly.0)
+        .map(|poly| [poly[0].0 as u32, poly[1].0 as u32, poly[2].0 as u32])
+        .collect();
+
+    let mut body_set = RigidBodySet::new();
+
+    let level_body = RigidBodyBuilder::new_static().build();
+    let level_body = body_set.insert(level_body);
+    let level_collider = ColliderBuilder::trimesh(verts, indices).build();
+
+    let player_body = RigidBodyBuilder::new_dynamic()
+        .position(Isometry3::translation(0.0, 10.0, 0.0))
+        .build();
+    let player_body = body_set.insert(player_body);
+    let player_collider = ColliderBuilder::cuboid(0.3, 0.3, 0.3).build();
+
+    let mut collider_set = ColliderSet::new();
+    collider_set.insert(level_collider, level_body, &mut body_set);
+    collider_set.insert(player_collider, player_body, &mut body_set);
+
+    let physics_pipeline = PhysicsPipeline::new();
+    let gravity = Vector3::new(0.0, -1., 0.0);
+    let physics_integration_parameters = IntegrationParameters::default();
+    let broad_phase = BroadPhase::new();
+    let narrow_phase = NarrowPhase::new();
+    let joints = JointSet::new();
+
+    // Load level
     let (level_mesh, level_material) = load_gltf(
         &app.renderer,
         concat!(env!("CARGO_MANIFEST_DIR"), "/data/level.glb"),
@@ -322,6 +390,19 @@ fn init(app: &mut App) -> Game1 {
         level_material,
         level_mesh,
         level_handle,
+
+        //physics
+        physics_pipeline,
+        gravity,
+        physics_integration_parameters,
+        broad_phase,
+        narrow_phase,
+        rigidbodies: body_set,
+        colliders: collider_set,
+        joints,
+
+        player_body_handle: player_body,
+        level_body_handle: level_body,
     }
 }
 
@@ -353,41 +434,62 @@ impl State for Game1 {
 
         let forward = {
             if let CameraProjection::Projection { yaw, pitch, .. } = &mut self.camera.projection {
-                Vec3A::new(
-                    yaw.sin() * pitch.cos(),
-                    -pitch.sin(),
-                    yaw.cos() * pitch.cos(),
-                )
+                Vector3::new(yaw.sin() * pitch.cos(), 0., yaw.cos() * pitch.cos())
             } else {
                 unreachable!()
             }
         };
-        let up = Vec3A::unit_y();
-        let side: Vec3A = forward.cross(up).normalize();
+        let side = forward.cross(&Vector3::new(0., 1., 0.)).normalize();
+
         let velocity = match app.input.is_scancode_pressed(platform::Scancodes::SHIFT) {
             true => 4.0,
             false => 1.0,
         };
 
+        let mut movement = Vector3::new(0., 0., 0.);
+
         if app.input.is_scancode_pressed(platform::Scancodes::W) {
-            self.camera.location += forward * velocity * app.delta_time;
+            movement += forward * velocity * app.delta_time;
         }
         if app.input.is_scancode_pressed(platform::Scancodes::S) {
-            self.camera.location -= forward * velocity * app.delta_time;
+            movement -= forward * velocity * app.delta_time;
         }
         if app.input.is_scancode_pressed(platform::Scancodes::A) {
-            self.camera.location += side * velocity * app.delta_time;
+            movement += side * velocity * app.delta_time;
         }
         if app.input.is_scancode_pressed(platform::Scancodes::D) {
-            self.camera.location -= side * velocity * app.delta_time;
-        }
-        if app.input.is_scancode_pressed(platform::Scancodes::Q) {
-            self.camera.location += up * velocity * app.delta_time;
-        }
-        if app.input.is_scancode_pressed(platform::Scancodes::Z) {
-            self.camera.location -= up * velocity * app.delta_time;
+            movement -= side * velocity * app.delta_time;
         }
 
+        let camera_body = self.rigidbodies.get_mut(self.player_body_handle).unwrap();
+        let new_iso = Isometry3::from_parts(
+            (camera_body.position().translation.vector + movement).into(),
+            camera_body.position().rotation,
+        );
+        camera_body.set_position(new_iso, true);
+
+        self.physics_pipeline.step(
+            &self.gravity,
+            &self.physics_integration_parameters,
+            &mut self.broad_phase,
+            &mut self.narrow_phase,
+            &mut self.rigidbodies,
+            &mut self.colliders,
+            &mut self.joints,
+            None,
+            None,
+            &(),
+        );
+
+        let camera_position = self
+            .rigidbodies
+            .get(self.player_body_handle)
+            .unwrap()
+            .position()
+            .translation
+            .vector;
+        let camera_position = [camera_position[0], camera_position[1], camera_position[2]];
+        self.camera.location = camera_position.into();
         app.renderer.set_camera_data(self.camera);
 
         if self.path.len() > 0 {

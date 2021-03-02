@@ -31,7 +31,8 @@ impl App {
         let window_size = window.inner_size();
 
         let mut options = rend3::RendererOptions {
-            vsync: rend3::VSyncMode::Off,
+            ambient: glam::Vec4::new(0.1, 0.1, 0.1, 1.0),
+            vsync: rend3::VSyncMode::On,
             size: [window_size.width, window_size.height],
         };
 
