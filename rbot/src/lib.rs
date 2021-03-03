@@ -1,6 +1,6 @@
 use rend3::Renderer;
 use std::{sync::Arc, time::Instant};
-use winit::event::*;
+use winit::{dpi::PhysicalSize, event::*};
 
 pub mod input;
 pub use input::InputCtx;
@@ -25,6 +25,7 @@ impl App {
         let window = {
             let mut builder = winit::window::WindowBuilder::new();
             builder = builder.with_title("rbot engine");
+            builder = builder.with_inner_size(PhysicalSize::new(1280, 720));
             builder.build(&event_loop).expect("Could not build window")
         };
 
@@ -104,8 +105,6 @@ impl App {
                 timestamp_last_frame = now;
 
                 state.update(&mut app);
-
-                app.renderer.set_options(options.clone());
 
                 // Size of the internal buffers used for rendering.
                 //

@@ -18,6 +18,7 @@ use rend3::{
     },
     Renderer,
 };
+use winit::event::VirtualKeyCode;
 
 mod platform;
 
@@ -320,17 +321,17 @@ fn init(app: &mut App) -> Game1 {
     let level_collider = ColliderBuilder::trimesh(verts, indices).build();
 
     let player_body = RigidBodyBuilder::new_dynamic()
-        .position(Isometry3::translation(0.0, 10.0, 0.0))
+        .position(Isometry3::translation(0.0, 5.0, 0.0))
         .build();
     let player_body = body_set.insert(player_body);
-    let player_collider = ColliderBuilder::cuboid(0.3, 0.3, 0.3).build();
+    let player_collider = ColliderBuilder::cuboid(0.3, 0.5, 0.3).build();
 
     let mut collider_set = ColliderSet::new();
     collider_set.insert(level_collider, level_body, &mut body_set);
     collider_set.insert(player_collider, player_body, &mut body_set);
 
     let physics_pipeline = PhysicsPipeline::new();
-    let gravity = Vector3::new(0.0, -1., 0.0);
+    let gravity = Vector3::new(0.0, -2., 0.0);
     let physics_integration_parameters = IntegrationParameters::default();
     let broad_phase = BroadPhase::new();
     let narrow_phase = NarrowPhase::new();
@@ -434,7 +435,7 @@ impl State for Game1 {
 
         let forward = {
             if let CameraProjection::Projection { yaw, pitch, .. } = &mut self.camera.projection {
-                Vector3::new(yaw.sin() * pitch.cos(), 0., yaw.cos() * pitch.cos())
+                Vector3::new(yaw.sin() * pitch.cos(), 0., yaw.cos() * pitch.cos()).normalize()
             } else {
                 unreachable!()
             }
@@ -447,6 +448,8 @@ impl State for Game1 {
         };
 
         let mut movement = Vector3::new(0., 0., 0.);
+
+        let jumped = app.input.is_keycode_just_pressed(VirtualKeyCode::Space);
 
         if app.input.is_scancode_pressed(platform::Scancodes::W) {
             movement += forward * velocity * app.delta_time;
@@ -467,6 +470,12 @@ impl State for Game1 {
             camera_body.position().rotation,
         );
         camera_body.set_position(new_iso, true);
+        if jumped {
+            camera_body.apply_force(Vector3::new(0., 30., 0.), true);
+        }
+
+        let linvel = *camera_body.linvel();
+        camera_body.set_linvel(Vector3::new(0., linvel[1], 0.), true);
 
         self.physics_pipeline.step(
             &self.gravity,
